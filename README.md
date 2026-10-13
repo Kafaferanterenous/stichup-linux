@@ -1,3 +1,3 @@
 # StichUp Linux
 
-A PDF stitching (stitch/up) tool for Linux.
+Goal: simple PDF stitching (stich/up) tool for Linux. Start minimal and build up.
