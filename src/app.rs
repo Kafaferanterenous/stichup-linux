@@ -1,0 +1,128 @@
+use egui::{Color32, RichText, Ui, Window, SidePanel, TopBottomPanel, CentralPanel};
+use crate::stitch::merge_pdfs;
+use std::path::Path;
+
+#[derive(Default)]
+pub struct StichUpApp {
+    pdf_paths: Vec<String>,
+    output_path: String,
+    status: String,
+    show_help: bool,
+    text_edit_mode: bool,
+    current_text: String,
+    show_thumbnails: bool,
+    show_bookmarks: bool,
+    page_view: PageView,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum PageView {
+    #[default]
+    FullPage,
+    FitWidth,
+    TwoPages,
+}
+
+impl StichUpApp {
+    pub fn new(_cc: &eframe::CreationContext) -> Self {
+        Self {
+            pdf_paths: vec![],
+            output_path: "merged.pdf".to_string(),
+            status: "Ready".to_string(),
+            show_help: false,
+            text_edit_mode: false,
+            current_text: String::new(),
+            show_thumbnails: true,
+            show_bookmarks: false,
+            page_view: PageView::FullPage,
+        }
+    }
+}
+
+impl eframe::App for StichUpApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        ctx.input(|i| {
+            if i.key_pressed(egui::Key::F8) {
+                self.show_thumbnails = !self.show_thumbnails;
+            }
+            if i.key_pressed(egui::Key::F9) {
+                self.page_view = match self.page_view {
+                    PageView::FullPage => PageView::FitWidth,
+                    PageView::FitWidth => PageView::TwoPages,
+                    PageView::TwoPages => PageView::FullPage,
+                };
+            }
+        });
+
+        TopBottomPanel::top("top_panel").show(ctx, |ui| {
+            egui::menu::bar(ui, |ui| {
+                ui.menu_button("File", |ui| {
+                    if ui.button("Add PDF(s)").clicked() {
+                        if let Some(files) = rfd::FileDialog::new()
+                            .add_filter("PDF", &["pdf"])
+                            .pick_files()
+                        {
+                            for f in files {
+                                self.pdf_paths.push(f.to_string_lossy().to_string());
+                            }
+                            self.status = format!("Added {} file(s)", self.pdf_paths.len());
+                        }
+                        ui.close_menu();
+                    }
+                    if ui.button("Merge & Save").clicked() {
+                        if self.pdf_paths.is_empty() {
+                            self.status = "No PDFs to merge".to_string();
+                        } else {
+                            match merge_pdfs(&self.pdf_paths) {
+                                Ok(mut doc) => {
+                                    let out = if self.output_path.ends_with(".pdf") { self.output_path.clone() } else { format!("{}.pdf", self.output_path) };
+                                    match doc.save(&out) {
+                                        Ok(_) => self.status = format!("Merged {} PDFs → {}", self.pdf_paths.len(), out),
+                                        Err(e) => self.status = format!("Save failed: {}", e),
+                                    }
+                                }
+                                Err(e) => self.status = format!("Merge failed: {}", e),
+                            }
+                        }
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button("Clear").clicked() {
+                        self.pdf_paths.clear();
+                        self.status = "Cleared".to_string();
+                        ui.close_menu();
+                    }
+                });
+                ui.menu_button("View", |ui| {
+                    if ui.checkbox(&mut self.show_thumbnails, "Thumbnails (F8)").changed() {}
+                    if ui.checkbox(&mut self.show_bookmarks, "Bookmarks (F8/Toggle)").changed() {}
+                    ui.separator();
+                    ui.radio_value(&mut self.page_view, PageView::FullPage, "Full Page");
+                    ui.radio_value(&mut self.page_view, PageView::FitWidth, "Fit Width (F9)");
+                    ui.radio_value(&mut self.page_view, PageView::TwoPages, "Two Pages (F9)");
+                });
+                ui.menu_button("Edit", |ui| {
+                    if ui.button("Toggle Text Edit Mode (preview)").clicked() {
+                        self.text_edit_mode = !self.text_edit_mode;
+                        self.status = if self.text_edit_mode { "Text edit mode enabled (experimental)".to_string() } else { "Text edit mode disabled".to_string() };
+                        ui.close_menu();
+                    }
+                });
+                ui.menu_button("Export", |ui| {
+                    if ui.button("Export to DOCX (requires pandoc)").clicked() {
+                        self.status = "Export stub: needs pandoc".to_string();
+                        ui.close_menu();
+                    }
+                    if ui.button("Export to ODT (requires pandoc)").clicked() {
+                        self.status = "Export stub: needs pandoc".to_string();
+                        ui.close_menu();
+                    }
+                    if ui.button("Export Pages as JPG/PNG (requires pdftoppm)").clicked() {
+                        self.status = "Export stub: needs pdftoppm".to_string();
+                        ui.close_menu();
+                    }
+                });
+            });
+        });
+    }
+}
