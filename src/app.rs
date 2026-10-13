@@ -1,4 +1,5 @@
 use egui::{RichText, Window, SidePanel, TopBottomPanel, CentralPanel};
+use eframe::App;
 use crate::stitch::merge_pdfs;
 use std::path::Path;
 use std::process::Command;
@@ -8,6 +9,7 @@ struct PageItem {
     path: String,
     name: String,
     removed: bool,
+    thumb: Option<String>,
 }
 
 #[derive(Default)]
@@ -45,8 +47,19 @@ impl StichUpApp {
             page_view: PageView::FullPage,
         }
     }
+
+    fn make_thumb(&mut self, idx: usize) {
+        if idx >= self.pages.len() { return; }
+        let pdf = self.pages[idx].path.clone();
+        let prefix = format!("/tmp/stichup_thumb_{}_{}", std::process::id(), idx);
+        let _ = Command::new("pdftoppm").args(["-png", "-f", "1", "-l", "1", "-scale-to", "96", &pdf, &prefix]).output();
+        let candidate1 = format!("{}-1.png", prefix);
+        if Path::new(&candidate1).exists() {
+            self.pages[idx].thumb = Some(candidate1);
+        }
+    }
 }
-impl eframe::App for StichUpApp {
+impl App for StichUpApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.input(|i| {
             if i.key_pressed(egui::Key::F8) {
@@ -66,17 +79,22 @@ impl eframe::App for StichUpApp {
                 ui.menu_button("File", |ui| {
                     if ui.button("Add PDF(s)").clicked() {
                         if let Some(files) = rfd::FileDialog::new().add_filter("PDF", &["pdf"]).pick_files() {
-                            for f in files {
-                                let p = f.to_string_lossy().to_string();
-                                let name = Path::new(&p).file_name().unwrap_or_default().to_string_lossy().to_string();
-                                self.pages.push(PageItem { path: p, name, removed: false });
+                            let fcount = files.len();
+                            let paths: Vec<String> = files.iter().map(|f| f.to_string_lossy().to_string()).collect();
+                            for p in &paths {
+                                let name = Path::new(p).file_name().unwrap_or_default().to_string_lossy().to_string();
+                                self.pages.push(PageItem { path: p.clone(), name, removed: false, thumb: None });
                             }
-                            self.status = format!("Added {} page-group(s)/files", self.pages.len());
+                            let start = self.pages.len().saturating_sub(fcount);
+                            for i in start..self.pages.len() {
+                                self.make_thumb(i);
+                            }
+                            self.status = format!("Added {} file(s)", self.pages.len());
                         }
                         ui.close_menu();
                     }
                     if ui.button("Merge & Save").clicked() {
-                        let mut paths: Vec<String> = self.pages.iter().filter(|x| !x.removed).map(|x| x.path.clone()).collect();
+                        let paths: Vec<String> = self.pages.iter().filter(|x| !x.removed).map(|x| x.path.clone()).collect();
                         if paths.is_empty() {
                             self.status = "No PDFs to merge".to_string();
                         } else {
@@ -127,22 +145,21 @@ impl eframe::App for StichUpApp {
             });
             egui::Frame::none().fill(ui.visuals().extreme_bg_color).show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.button(RichText::new("📄 New").small());
-                    ui.button(RichText::new("📂 Open").small());
-                    ui.button(RichText::new("💾 Save").small());
+                    ui.button(RichText::new("New").small());
+                    ui.button(RichText::new("Open").small());
+                    ui.button(RichText::new("Save").small());
                     ui.separator();
-                    ui.button(RichText::new("✂️ Cut").small());
-                    ui.button(RichText::new("📋 Copy").small());
-                    ui.button(RichText::new("📌 Paste").small());
+                    ui.button(RichText::new("Cut").small());
+                    ui.button(RichText::new("Copy").small());
+                    ui.button(RichText::new("Paste").small());
                     ui.separator();
-                    ui.button(RichText::new("↩ Undo").small());
-                    ui.button(RichText::new("↪ Redo").small());
                     ui.label(format!("{:?}", self.page_view));
                 });
             });
         });
+
         if self.show_thumbnails || self.show_bookmarks {
-            SidePanel::left("sidebar").resizable(true).default_width(180.0).show(ctx, |ui| {
+            SidePanel::left("sidebar").resizable(true).default_width(200.0).show(ctx, |ui| {
                 ui.heading("Sidebar");
                 ui.checkbox(&mut self.show_thumbnails, "Thumbnails (F8)");
                 ui.checkbox(&mut self.show_bookmarks, "Bookmarks");
@@ -150,24 +167,34 @@ impl eframe::App for StichUpApp {
                 if self.show_thumbnails {
                     ui.label("Pages");
                     egui::ScrollArea::vertical().show(ui, |ui| {
-                        let len = self.pages.iter().filter(|x| !x.removed).count();
                         for i in 0..self.pages.len() {
                             if self.pages[i].removed { continue; }
+                            let thumb = self.pages[i].thumb.clone();
                             let name = self.pages[i].name.clone();
-                            ui.horizontal(|ui| {
-                                ui.label(format!("{}.", i+1));
-                                if ui.small_button("↑").clicked() && i>0 {
-                                    // swap with previous non-removed? easier: just swap
-                                    self.pages.swap(i, i-1);
+                            let mut up = false;
+                            let mut down = false;
+                            let mut remove = false;
+                            ui.vertical(|ui| {
+                                if let Some(t) = &thumb {
+                                    if let Ok(img) = image::open(t) {
+                                        let rgba = img.to_rgba8();
+                                        let size = [rgba.width() as usize, rgba.height() as usize];
+                                        let color_image = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_flat_samples().as_slice());
+                                        let tex = ui.ctx().load_texture(t, color_image, egui::TextureOptions::LINEAR);
+                                        ui.image((tex.id(), egui::vec2(96.0, 128.0)));
+                                    }
                                 }
-                                if ui.small_button("↓").clicked() && i+1 < self.pages.len() {
-                                    self.pages.swap(i, i+1);
-                                }
-                                if ui.small_button("✕").clicked() {
-                                    self.pages[i].removed = true;
-                                }
+                                ui.horizontal(|ui| {
+                                    ui.label(format!("{}.", i+1));
+                                    if ui.small_button("↑").clicked() && i>0 { up = true; }
+                                    if ui.small_button("↓").clicked() && i+1 < self.pages.len() { down = true; }
+                                    if ui.small_button("✕").clicked() { remove = true; }
+                                });
+                                ui.label(&name);
                             });
-                            ui.label(name);
+                            if up { self.pages.swap(i, i-1); }
+                            if down { self.pages.swap(i, i+1); }
+                            if remove { self.pages[i].removed = true; }
                         }
                     });
                 }
@@ -186,35 +213,12 @@ impl eframe::App for StichUpApp {
                 ui.label("Output:");
                 ui.text_edit_singleline(&mut self.output_path);
             });
-            ui.separator();
-            ui.label("Pages (reorder/remove):");
-            egui::ScrollArea::vertical().max_height(250.0).show(ui, |ui| {
-                let mut remove_idx: Option<usize> = None;
-                for i in 0..self.pages.len() {
-                    if self.pages[i].removed { continue; }
-                    let name = self.pages[i].name.clone();
-                    ui.horizontal(|ui| {
-                        ui.label(format!("{}. {}", i+1, &name));
-                        if ui.small_button("Up").clicked() && i>0 { self.pages.swap(i, i-1); }
-                        if ui.small_button("Remove").clicked() { remove_idx = Some(i); }
-                    });
-                }
-                if let Some(i) = remove_idx { self.pages[i].removed = true; }
-            });
-            ui.separator();
-            if self.text_edit_mode {
-                ui.group(|ui| {
-                    ui.label("Text Edit Mode");
-                    ui.text_edit_multiline(&mut self.current_text);
-                });
-            }
             ui.label(&self.status);
         });
 
         if self.show_help {
             Window::new("About StichUp").open(&mut self.show_help).show(ctx, |ui| {
                 ui.label("StichUp v0.1.0");
-                ui.label("Built with egui + lopdf");
                 ui.label("Linux-only");
             });
         }
