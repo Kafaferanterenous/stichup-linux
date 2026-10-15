@@ -23,6 +23,10 @@ pub struct StichUpApp {
     show_thumbnails: bool,
     show_bookmarks: bool,
     page_view: PageView,
+    show_print_preview: bool,
+    preview_imgs: Vec<String>,
+    preview_page: usize,
+    printers: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -45,6 +49,10 @@ impl StichUpApp {
             show_thumbnails: true,
             show_bookmarks: false,
             page_view: PageView::FullPage,
+            show_print_preview: false,
+            preview_imgs: vec![],
+            preview_page: 0,
+            printers: vec![],
         }
     }
 
@@ -56,6 +64,103 @@ impl StichUpApp {
         let candidate1 = format!("{}-1.png", prefix);
         if Path::new(&candidate1).exists() {
             self.pages[idx].thumb = Some(candidate1);
+        }
+    }
+
+    fn active_paths(&self) -> Vec<String> {
+        self.pages.iter().filter(|x| !x.removed).map(|x| x.path.clone()).collect()
+    }
+
+    /// Ensure the merged output exists and return its path.
+    fn ensure_output(&mut self) -> Option<String> {
+        let paths = self.active_paths();
+        if paths.is_empty() {
+            // fall back to a single PDF if only one page group exists but marked
+            self.status = "No PDFs to process".to_string();
+            return None;
+        }
+        let out = if self.output_path.ends_with(".pdf") {
+            self.output_path.clone()
+        } else {
+            format!("{}.pdf", self.output_path)
+        };
+        match merge_pdfs(&paths) {
+            Ok(mut doc) => match doc.save(&out) {
+                Ok(_) => Some(out),
+                Err(e) => {
+                    self.status = format!("Save failed: {}", e);
+                    None
+                }
+            },
+            Err(e) => {
+                self.status = format!("Merge failed: {}", e);
+                None
+            }
+        }
+    }
+
+    fn do_export_images(&mut self) {
+        let Some(pdf) = self.ensure_output() else { return };
+        let Some(dir) = rfd::FileDialog::new().pick_folder() else { return };
+        let dir = dir.to_string_lossy().to_string();
+        let stem = Path::new(&pdf).file_stem().unwrap_or_default().to_string_lossy().to_string();
+        match crate::export::export_images(&pdf, &dir, &stem, 150) {
+            Ok(files) => self.status = format!("Exported {} page image(s) to {}", files.len(), dir),
+            Err(e) => self.status = format!("Export images failed: {}", e),
+        }
+    }
+
+    fn do_export_text(&mut self) {
+        let Some(pdf) = self.ensure_output() else { return };
+        let Some(out) = rfd::FileDialog::new()
+            .add_filter("Text", &["txt"])
+            .set_file_name("output.txt")
+            .save_file()
+        else {
+            return;
+        };
+        let out = out.to_string_lossy().to_string();
+        match crate::export::export_text(&pdf, &out) {
+            Ok(_) => self.status = format!("Exported text → {}", out),
+            Err(e) => self.status = format!("Export text failed: {}", e),
+        }
+    }
+
+    fn do_export_doc(&mut self, ext: &str) {
+        let Some(pdf) = self.ensure_output() else { return };
+        let Some(dir) = rfd::FileDialog::new().pick_folder() else { return };
+        let dir = dir.to_string_lossy().to_string();
+        match crate::export::export_doc(&pdf, &dir, ext) {
+            Ok(p) => self.status = format!("Exported → {}", p),
+            Err(e) => self.status = format!("Export {} failed: {}", ext, e),
+        }
+    }
+
+    fn do_print(&mut self, printer: Option<&str>) {
+        let Some(pdf) = self.ensure_output() else { return };
+        match crate::export::print_pdf(&pdf, printer) {
+            Ok(_) => self.status = format!(
+                "Sent to printer{}",
+                printer.map(|p| format!(" '{}'", p)).unwrap_or_default()
+            ),
+            Err(e) => self.status = format!("Print failed: {}", e),
+        }
+    }
+
+    fn open_print_preview(&mut self) {
+        let Some(pdf) = self.ensure_output() else { return };
+        let dir = format!("/tmp/stichup_preview_{}", std::process::id());
+        let _ = std::fs::remove_dir_all(&dir);
+        match crate::export::export_images(&pdf, &dir, "page", 110) {
+            Ok(files) if !files.is_empty() => {
+                self.preview_imgs = files;
+                self.preview_page = 0;
+                self.printers = crate::export::list_printers();
+                self.show_print_preview = true;
+                self.status = "Print preview ready".to_string();
+            }
+            Ok(_) => self.status = "Print preview: no pages".to_string(),
+            Err(e) => self.status = format!("Preview failed: {}", e),
         }
     }
 }
@@ -117,6 +222,27 @@ impl App for StichUpApp {
                         self.status = "Cleared".to_string();
                         ui.close_menu();
                     }
+                    ui.separator();
+                    if ui.button("Print Preview…").clicked() {
+                        self.open_print_preview();
+                        ui.close_menu();
+                    }
+                    if ui.button("Print (default printer)").clicked() {
+                        self.do_print(None);
+                        ui.close_menu();
+                    }
+                    ui.menu_button("Print to…", |ui| {
+                        let printers = crate::export::list_printers();
+                        if printers.is_empty() {
+                            ui.label(RichText::new("No printers found").italics());
+                        }
+                        for p in printers {
+                            if ui.button(&p).clicked() {
+                                self.do_print(Some(&p));
+                                ui.close_menu();
+                            }
+                        }
+                    });
                 });
                 ui.menu_button("View", |ui| {
                     ui.checkbox(&mut self.show_thumbnails, "Thumbnails (F8)");
@@ -134,10 +260,31 @@ impl App for StichUpApp {
                     }
                 });
                 ui.menu_button("Export", |ui| {
-                    ui.label(RichText::new("Requires pandoc/pdftoppm").small());
-                    if ui.button("DOCX (stub)").clicked() { self.status = "Export stub".to_string(); ui.close_menu(); }
-                    if ui.button("ODT (stub)").clicked() { self.status = "Export stub".to_string(); ui.close_menu(); }
-                    if ui.button("Images (stub)").clicked() { self.status = "Export stub".to_string(); ui.close_menu(); }
+                    let hints = format!(
+                        "pdftoppm:{} pdftotext:{} pandoc:{} libreoffice:{}",
+                        crate::export::have("pdftoppm"),
+                        crate::export::have("pdftotext"),
+                        crate::export::have("pandoc"),
+                        crate::export::have("libreoffice"),
+                    );
+                    ui.label(RichText::new(hints).small());
+                    ui.separator();
+                    if ui.button("Pages as Images (PNG)…").clicked() {
+                        self.do_export_images();
+                        ui.close_menu();
+                    }
+                    if ui.button("Text (.txt)…").clicked() {
+                        self.do_export_text();
+                        ui.close_menu();
+                    }
+                    if ui.button("Word (.docx)…").clicked() {
+                        self.do_export_doc("docx");
+                        ui.close_menu();
+                    }
+                    if ui.button("OpenDocument (.odt)…").clicked() {
+                        self.do_export_doc("odt");
+                        ui.close_menu();
+                    }
                 });
                 ui.menu_button("Help", |ui| {
                     if ui.button("About").clicked() { self.show_help = true; ui.close_menu(); }
@@ -215,6 +362,53 @@ impl App for StichUpApp {
             });
             ui.label(&self.status);
         });
+
+        if self.show_print_preview {
+            let mut open = true;
+            Window::new("Print Preview")
+                .open(&mut open)
+                .default_width(560.0)
+                .show(ctx, |ui| {
+                    let total = self.preview_imgs.len();
+                    ui.horizontal(|ui| {
+                        if ui.button("◀ Prev").clicked() && self.preview_page > 0 {
+                            self.preview_page -= 1;
+                        }
+                        if total > 0 {
+                            ui.label(format!("Page {} / {}", self.preview_page + 1, total));
+                        }
+                        if ui.button("Next ▶").clicked() && self.preview_page + 1 < total {
+                            self.preview_page += 1;
+                        }
+                    });
+                    ui.separator();
+                    if let Some(p) = self.preview_imgs.get(self.preview_page) {
+                        if let Ok(img) = image::open(p) {
+                            let rgba = img.to_rgba8();
+                            let (w, h) = (rgba.width() as usize, rgba.height() as usize);
+                            let ci = egui::ColorImage::from_rgba_unmultiplied(
+                                [w, h],
+                                rgba.as_flat_samples().as_slice(),
+                            );
+                            let tex = ui.ctx().load_texture(
+                                format!("preview_{}", self.preview_page),
+                                ci,
+                                egui::TextureOptions::LINEAR,
+                            );
+                            ui.image((tex.id(), egui::vec2(w as f32 * 0.5, h as f32 * 0.5)));
+                        }
+                    } else {
+                        ui.label(RichText::new("No preview pages").italics());
+                    }
+                    ui.separator();
+                    if ui.button("Print").clicked() {
+                        self.do_print(None);
+                    }
+                });
+            if !open {
+                self.show_print_preview = false;
+            }
+        }
 
         if self.show_help {
             Window::new("About StichUp").open(&mut self.show_help).show(ctx, |ui| {
