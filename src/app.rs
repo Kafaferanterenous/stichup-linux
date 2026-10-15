@@ -27,6 +27,16 @@ pub struct StichUpApp {
     preview_imgs: Vec<String>,
     preview_page: usize,
     printers: Vec<String>,
+    show_page_manager: bool,
+    pm_source: String,
+    pm_pages: Vec<PmItem>,
+}
+
+#[derive(Clone, Debug)]
+struct PmItem {
+    orig: usize,
+    rotate: i64,
+    thumb: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -53,6 +63,9 @@ impl StichUpApp {
             preview_imgs: vec![],
             preview_page: 0,
             printers: vec![],
+            show_page_manager: false,
+            pm_source: String::new(),
+            pm_pages: vec![],
         }
     }
 
@@ -163,6 +176,87 @@ impl StichUpApp {
             Err(e) => self.status = format!("Preview failed: {}", e),
         }
     }
+
+    fn open_page_manager(&mut self) {
+        let Some(pdf) = self.ensure_output() else { return };
+        let n = crate::pages::page_count(&pdf);
+        if n == 0 {
+            self.status = "Page manager: no pages found".to_string();
+            return;
+        }
+        let dir = format!("/tmp/stichup_pm_{}", std::process::id());
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let prefix = format!("{}/p", dir);
+        let _ = Command::new("pdftoppm")
+            .args(["-png", "-r", "50", &pdf, &prefix])
+            .output();
+        let mut thumbs: Vec<String> = std::fs::read_dir(&dir)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .map(|e| e.path().to_string_lossy().to_string())
+                    .filter(|p| p.ends_with(".png"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        thumbs.sort();
+        let mut items = Vec::with_capacity(n);
+        for i in 0..n {
+            items.push(PmItem {
+                orig: i + 1,
+                rotate: 0,
+                thumb: thumbs.get(i).cloned(),
+            });
+        }
+        self.pm_source = pdf;
+        self.pm_pages = items;
+        self.show_page_manager = true;
+        self.status = format!("Page manager: {} pages", n);
+    }
+
+    fn apply_page_manager(&mut self) {
+        if self.pm_pages.is_empty() {
+            self.status = "Page manager: nothing to apply".to_string();
+            return;
+        }
+        let src = self.pm_source.clone();
+        let order: Vec<usize> = self.pm_pages.iter().map(|p| p.orig).collect();
+        let tmp = format!("/tmp/stichup_pm_reorder_{}.pdf", std::process::id());
+        if let Err(e) = crate::pages::reorder_pages(&src, &order, &tmp) {
+            self.status = format!("Reorder failed: {}", e);
+            return;
+        }
+        // Apply rotations (disjoint page groups -> safe sequential passes).
+        let mut cur = tmp.clone();
+        let angles = [90i64, 180, 270];
+        for deg in angles {
+            let pages: Vec<usize> = self
+                .pm_pages
+                .iter()
+                .enumerate()
+                .filter(|(_, it)| it.rotate.rem_euclid(360) == deg)
+                .map(|(j, _)| j + 1)
+                .collect();
+            if pages.is_empty() {
+                continue;
+            }
+            let out = format!("/tmp/stichup_pm_rot{}_{}.pdf", deg, std::process::id());
+            if let Err(e) = crate::pages::rotate_pages(&cur, &pages, deg, &out) {
+                self.status = format!("Rotate failed: {}", e);
+                return;
+            }
+            cur = out;
+        }
+        let target = if self.output_path.ends_with(".pdf") {
+            self.output_path.clone()
+        } else {
+            format!("{}.pdf", self.output_path)
+        };
+        match std::fs::copy(&cur, &target) {
+            Ok(_) => self.status = format!("Page edits applied → {}", target),
+            Err(e) => self.status = format!("Apply failed: {}", e),
+        }
+    }
 }
 impl App for StichUpApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -220,6 +314,11 @@ impl App for StichUpApp {
                     if ui.button("Clear").clicked() {
                         self.pages.clear();
                         self.status = "Cleared".to_string();
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button("Page Manager…").clicked() {
+                        self.open_page_manager();
                         ui.close_menu();
                     }
                     ui.separator();
@@ -362,6 +461,79 @@ impl App for StichUpApp {
             });
             ui.label(&self.status);
         });
+
+        if self.show_page_manager {
+            let mut open = true;
+            Window::new("Page Manager")
+                .open(&mut open)
+                .default_size([720.0, 560.0])
+                .show(ctx, |ui| {
+                    ui.label("Reorder, rotate or remove pages, then Apply.");
+                    ui.horizontal(|ui| {
+                        if ui.button("Apply").clicked() {
+                            self.apply_page_manager();
+                        }
+                        if ui.button("Reload").clicked() {
+                            self.open_page_manager();
+                        }
+                        ui.label(format!("{} page(s)", self.pm_pages.len()));
+                    });
+                    ui.separator();
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        let mut up: Option<usize> = None;
+                        let mut down: Option<usize> = None;
+                        let mut del: Option<usize> = None;
+                        let mut rot_l: Option<usize> = None;
+                        let mut rot_r: Option<usize> = None;
+                        for i in 0..self.pm_pages.len() {
+                            let thumb = self.pm_pages[i].thumb.clone();
+                            let orig = self.pm_pages[i].orig;
+                            let rot = self.pm_pages[i].rotate.rem_euclid(360);
+                            ui.horizontal(|ui| {
+                                ui.vertical(|ui| {
+                                    if let Some(t) = &thumb {
+                                        if let Ok(img) = image::open(t) {
+                                            let rgba = img.to_rgba8();
+                                            let (w, h) = (rgba.width() as usize, rgba.height() as usize);
+                                            let ci = egui::ColorImage::from_rgba_unmultiplied(
+                                                [w, h],
+                                                rgba.as_flat_samples().as_slice(),
+                                            );
+                                            let tex = ui.ctx().load_texture(
+                                                format!("pm_{}", i),
+                                                ci,
+                                                egui::TextureOptions::LINEAR,
+                                            );
+                                            ui.image((tex.id(), egui::vec2(70.0, 90.0)));
+                                        }
+                                    }
+                                    ui.label(format!("src {}", orig));
+                                });
+                                ui.vertical(|ui| {
+                                    ui.label(format!("out {}", i + 1));
+                                    ui.label(format!("~{}°", rot));
+                                    ui.horizontal(|ui| {
+                                        if ui.small_button("◀").clicked() && i > 0 { up = Some(i); }
+                                        if ui.small_button("▶").clicked() && i + 1 < self.pm_pages.len() { down = Some(i); }
+                                        if ui.small_button("↺").clicked() { rot_l = Some(i); }
+                                        if ui.small_button("↻").clicked() { rot_r = Some(i); }
+                                        if ui.small_button("🗑").clicked() { del = Some(i); }
+                                    });
+                                });
+                            });
+                            ui.separator();
+                        }
+                        if let Some(i) = up { self.pm_pages.swap(i, i - 1); }
+                        if let Some(i) = down { self.pm_pages.swap(i, i + 1); }
+                        if let Some(i) = rot_l { self.pm_pages[i].rotate -= 90; }
+                        if let Some(i) = rot_r { self.pm_pages[i].rotate += 90; }
+                        if let Some(i) = del { self.pm_pages.remove(i); }
+                    });
+                });
+            if !open {
+                self.show_page_manager = false;
+            }
+        }
 
         if self.show_print_preview {
             let mut open = true;

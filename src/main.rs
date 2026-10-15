@@ -1,6 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod export;
+mod pages;
 mod pdf;
 mod stitch;
 
@@ -17,4 +19,3 @@ fn main() -> eframe::Result<()> {
         Box::new(|cc| Box::new(app::StichUpApp::new(cc))),
     )
 }
-mod export;
