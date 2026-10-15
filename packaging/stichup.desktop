@@ -1,0 +1,7 @@
+[Desktop Entry]
+Name=StichUp
+Exec=stichup
+Icon=stichup
+Type=Application
+Categories=Utility;Office;
+Comment=PDF stitching and editing
